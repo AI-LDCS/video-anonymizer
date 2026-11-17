@@ -1,0 +1,54 @@
+# Runs the anonymizer worker next to the field-capture app stack (Docker Compose project "field-capture").
+# Pick ONE profile:
+#   gpu  NVIDIA GPU (needs the NVIDIA driver and nvidia-container-toolkit on the Linux host). Fails at start if CUDA is missing.
+#   cpu  no GPU, much slower. The only choice on macOS, where Docker cannot reach the GPU.
+#
+#   1. start the app stack first, so the "field-capture_default" network exists
+#   2. put the model in ./models (see README)
+#   3. ANONYMIZER_TOKEN=<the app's token> docker compose --profile gpu up -d --build
+#      (or: docker compose --env-file /path/to/the/app/.env --profile gpu up -d --build)
+# The worker joins the app's network and talks to it as http://app:3100; set APP_URL for another address.
+# Tuning (see README, "Using the GPU and CPU fully"): ANON_JOBS=2 runs two recordings at once; ANON_EXTRA='--batch 16 --workers 4'.
+name: video-anonymizer
+
+x-worker: &worker
+  restart: unless-stopped
+  environment:
+    ANONYMIZER_TOKEN: ${ANONYMIZER_TOKEN:?set ANONYMIZER_TOKEN to the app's token}
+  volumes:
+    - ./models:/app/models:ro
+
+services:
+  worker-gpu:
+    <<: *worker
+    profiles: ["gpu"]
+    image: video-anonymizer:gpu
+    build:
+      context: .
+      args:
+        # CUDA 13.0 build: what this tool was tested with, and it needs an older driver than the newest CUDA (13.2).
+        # Override with TORCH_INDEX=... (for example .../whl/cu126 for an older driver), or set it empty for the PyPI default.
+        TORCH_INDEX: ${TORCH_INDEX-https://download.pytorch.org/whl/cu130}
+    command: ["python", "worker.py", "--server", "${APP_URL:-http://app:3100}", "--allow-http", "--mode", "${ANON_MODE:-solid}", "--poll", "5", "--jobs", "${ANON_JOBS:-1}", "--extra", "${ANON_EXTRA:-}", "--device", "cuda"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  worker-cpu:
+    <<: *worker
+    profiles: ["cpu"]
+    image: video-anonymizer:cpu
+    build:
+      context: .
+      args:
+        TORCH_INDEX: https://download.pytorch.org/whl/cpu
+    command: ["python", "worker.py", "--server", "${APP_URL:-http://app:3100}", "--allow-http", "--mode", "${ANON_MODE:-solid}", "--poll", "5", "--jobs", "${ANON_JOBS:-1}", "--extra", "${ANON_EXTRA:-}", "--device", "cpu"]
+
+networks:
+  default:
+    name: field-capture_default
+    external: true

@@ -1,0 +1,8 @@
+# Lower bounds only, to avoid forced upgrades (tested: ultralytics 8.4.175, torch 2.13.0+cu130,
+# opencv-python 5.0.0.93, numpy 2.5.2, pillow 12.3.0). Lower bounds only, to avoid forced upgrades.
+ultralytics>=8.4
+torch>=2.0
+opencv-python>=4.8
+numpy>=1.24
+pillow>=10.0
+av>=14.0        # video decode/encode (bundles FFmpeg with H.264, VP9, AAC and Opus); tested: 19.0.2

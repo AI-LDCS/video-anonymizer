@@ -1,0 +1,21 @@
+# data: footage and results of test runs (faces, plates, people)
+input/
+output/
+
+# model weights (the large one is over GitHub's 100 MB limit); download them as the README says
+models/*.pt
+!models/.gitkeep
+
+# internal benchmark notes
+PROCESSING_TIME*.md
+
+# secrets and local config
+.env
+.env.*
+
+# python / OS
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
