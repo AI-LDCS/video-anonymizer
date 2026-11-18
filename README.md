@@ -141,7 +141,9 @@ $PY worker.py --server https://... --once                              # drain t
 $PY worker.py --server https://... --mode pixelgauss --device cuda --extra "--padding 0.3"
 ```
 
-It takes two kinds of job (`--kinds frames,video`, the default; frames first):
+It takes the **frames** job by default (`--kinds frames`). The whole-video copy is optional (`--kinds frames,video`, with
+`ANON_VIDEO_ENABLED=true` on the server): it anonymizes every frame, which is slow, and the app does not need it, because
+admins download the original and only the sampled images are anonymized. The two kinds:
 
 - **frames**: downloads the video and GPS, runs `sample_frames.py`, then `anonymize.py` on those frames, then `tag_gps.py`
   if the assignment is for inference, and uploads every image. Recordings of one assignment are done in order, so the

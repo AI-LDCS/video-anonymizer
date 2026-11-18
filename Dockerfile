@@ -1,5 +1,6 @@
 # The anonymizer worker: worker.py polls the field-capture app and, for each recording, cuts still images
-# (sample_frames.py), hides faces and plates (anonymize.py) and tags GPS (tag_gps.py); or anonymizes the whole video.
+# (sample_frames.py), hides faces and plates (anonymize.py) and tags GPS (tag_gps.py). The whole video is only
+# anonymized if you ask for it (ANON_KINDS=frames,video).
 #
 # GPU (the normal way, Linux with an NVIDIA GPU, the driver and nvidia-container-toolkit on the host):
 #   docker compose --profile gpu up -d --build
