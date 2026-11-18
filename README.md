@@ -174,6 +174,22 @@ Measure before keeping a change: while a video runs, `nvidia-smi dmon -s u` show
 near 100 means the GPU is the limit) and `htop` shows the CPU. FP16 is deliberately not used: it was slower
 and lost detections on GTX 16xx cards (see Performance).
 
+## Sharing a machine with the app
+
+If the worker runs on the same machine as the field-capture app, pin each to its own CPUs so they cannot starve each other.
+Use a Docker `cpuset` (not `cpus:`): the worker then sees only those CPUs and sizes its threads from them.
+
+```bash
+ANON_CPUSET=4-5 docker compose --env-file ../field-capture-app/.env \
+  -f docker-compose.yml -f docker-compose.cpuset.yml --profile gpu up -d
+```
+
+Measured on 6 cores and a GTX 1660 Ti, one 4.4 minute recording (the images job, anonymizing and tagging included):
+4 CPUs 81 s, 2 CPUs 89 s, about 0.9 GiB of memory. The images job is limited by decoding and the GPU, not by the CPU count,
+so give the worker few CPUs (2 is enough) and the rest to the app. The whole-video job (`--kinds frames,video`) scales with
+CPUs. The full guide, with a table of splits by machine size, is `docs/operations/cpu-affinity.md` in the field-capture-app
+repository.
+
 ## Docker
 
 One `Dockerfile`, two Compose profiles. The model goes in `models/` first (see [Install](#install)); it is
