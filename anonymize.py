@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Anonymize faces and license plates in images and videos using the YOLO26 face/plate detector.
 
-Detected regions are obscured with a strong Gaussian blur (default), pixelation, or
-solid masks. Files are re-encoded from raw pixels (no EXIF/ICC/XMP/text metadata)
+Detected regions are obscured with pixelation smoothed by a Gaussian blur (default),
+a plain Gaussian blur, pixelation, or solid masks. Files are re-encoded from raw pixels (no EXIF/ICC/XMP/text metadata)
 and written to a separate output directory. Source files are never modified.
 Video audio is dropped unless --keep-audio is given.
 """
@@ -57,8 +57,8 @@ def parse_args():
     p.add_argument("--face-conf", type=float, help="face threshold (default 0.222, overrides --confidence)")
     p.add_argument("--plate-conf", type=float, help="plate threshold (default 0.263, overrides --confidence)")
     p.add_argument("--imgsz", type=int, default=640, help="model input size (default 640, the training size)")
-    p.add_argument("--mode", choices=["gaussian", "pixelate", "solid"], default="gaussian",
-                   help="anonymization method (default: gaussian)")
+    p.add_argument("--mode", choices=["pixelgauss", "gaussian", "pixelate", "solid"], default="pixelgauss",
+                   help="anonymization method (default: pixelgauss = pixelate, then smooth with a Gaussian blur)")
     p.add_argument("--blur-kernel", type=int, default=MIN_BLUR_KERNEL,
                    help=f"minimum Gaussian kernel size, odd, >= {MIN_BLUR_KERNEL}; grows with region size (default 51)")
     p.add_argument("--pixel-size", type=int, default=12,
@@ -206,6 +206,10 @@ def anonymize(arr: np.ndarray, dets, a):
             small = cv2.resize(np.ascontiguousarray(roi), (max(1, round(rw / block)), max(1, round(rh / block))),
                                interpolation=cv2.INTER_AREA)
             roi[:] = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+            if a.mode == "pixelgauss":
+                # Smooth the hard block edges: kernel ~ twice the block size, always odd.
+                k = (2 * block) | 1
+                roi[:] = cv2.GaussianBlur(np.ascontiguousarray(roi), (k, k), 0, borderType=cv2.BORDER_REFLECT)
         if arr.shape[2] == 4:
             arr[t:b, l:r, 3] = 255  # opaque, so the alpha channel cannot reveal the region's shape
         regions.append((l, t, r, b))

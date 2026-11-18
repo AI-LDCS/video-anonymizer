@@ -23,7 +23,7 @@ curl -L -o models/yolo26m_face_lp.pt \
 ```bash
 PY=python
 
-# Directory, default mode (strong adaptive Gaussian blur)
+# Directory, default mode (pixelgauss: pixelate, then smooth with a Gaussian blur)
 $PY anonymize.py --input ./images --output ./output
 
 # Single image
@@ -47,7 +47,8 @@ $PY anonymize.py --input ./images --output ./output --mode gaussian --blur-kerne
 
 | `--mode` | Effect | Tuning |
 |---|---|---|
-| `gaussian` (default) | Gaussian blur. Kernel = max(`--blur-kernel`, ½ × region's longer side), always odd. | `--blur-kernel` (min 51, default 51) |
+| `pixelgauss` (default) | Pixelate as below, then a Gaussian blur over the region (kernel = 2 × block size, odd) to remove the hard block edges. | `--pixel-size` (default 12) |
+| `gaussian` | Gaussian blur. Kernel = max(`--blur-kernel`, ½ × region's longer side), always odd. | `--blur-kernel` (min 51, default 51) |
 | `pixelate` | Area-downscale then nearest-neighbour upscale. Block = max(`--pixel-size`, longer side / 16), so a region is never more than ~16 blocks across. | `--pixel-size` (default 12) |
 | `solid` | Pixels replaced with a solid colour (black). | `--fill R,G,B` |
 
@@ -64,7 +65,7 @@ each side) and clipped to the image. For RGBA images the region is also made opa
 |---|---|---|
 | `--input` | required | image/video file or directory |
 | `--output` | `./output` | output directory (must differ from input) |
-| `--mode` | `gaussian` | `gaussian`, `pixelate` or `solid` |
+| `--mode` | `pixelgauss` | `pixelgauss`, `gaussian`, `pixelate` or `solid` |
 | `--blur-kernel` | 51 | minimum Gaussian kernel (≥ 51) |
 | `--pixel-size` | 12 | minimum pixelation block size (px) |
 | `--padding` | 0.20 | box expansion ratio per side |
@@ -79,6 +80,54 @@ each side) and clipped to the image. For RGBA images the region is also made opa
 | `--temporal-window` | 5 | video: also mask each frame with the boxes from this many frames before and after it; `0` disables |
 | `--keep-audio` | off | video: keep the first audio track, re-encoded as stereo |
 
+## Still images (sampling)
+
+For labelling (CVAT) and for the scoring engine you rarely want the whole video, but one sharp, anonymized picture
+every few metres, with its position. Three small tools, each usable on its own:
+
+| Tool | What it does |
+|---|---|
+| `sample_frames.py` | video + `gps.json` -> the sharpest frame in every N metres walked (default 3), as lossless PNG, with `frames.json` and `manifest.csv`. **Raw: not anonymized.** |
+| `anonymize.py` | hides faces and plates (above). Run it on the folder the sampler wrote. |
+| `tag_gps.py` | writes GPS and the app's IDs into the anonymized PNGs (EXIF), after anonymizing. |
+| `pipeline.py` | runs them in order. `--stage both` (default), `sample` (stop before anonymizing) or `anonymize` (only hide faces). |
+
+```bash
+# everything: sample, anonymize, tag. Result in output/anonymized/
+python pipeline.py --video recording.webm --gps gps.json --assignment-json assignment.json --output output --step 3
+
+# training images (CVAT): no metadata inside the images
+python pipeline.py --video recording.webm --gps gps.json --output output --purpose training
+
+# only sample (raw frames!), or only anonymize some folder
+python pipeline.py --stage sample --video recording.webm --gps gps.json --output output
+python pipeline.py --stage anonymize --input output/frames_raw --output output
+```
+
+**How the frames are picked.** GPS points worse than 15 m are dropped, the track is smoothed (a local straight-line
+fit, so the ends are not pulled inwards), and the distance walked is added up; standing still counts as zero. The path
+is cut into bins of `--step` metres, each bin is mapped to a time range in the video, and every frame in it is scored
+with the variance of the Laplacian (higher is sharper). The best frame wins; a bin where everything is blurry still gets
+its least-blurry one, flagged `lowSharpness`. Frame times come from the video's own timestamps, because phone video has
+variable frame rate. Frames are saved at full size.
+
+**Frame position** is the smoothed track, not the raw fix, and `headingDeg` is the walking direction (`null` when standing still).
+
+**Several recordings of one walk.** `sample_frames.py --state-out state.json` writes the distance counter and the next
+frame number; pass it as `--state-in` for the next recording. The spacing then carries on across the restart, and a jump
+of more than `--gap-max` metres (default 15) is flagged: that frame is marked `afterGap` (with `gapM`) and the jump is not counted
+as walking, but the count still carries on, because a later recording is always the continuation of the earlier ones (the
+worker is told to restart where they stopped). The worker does this itself.
+
+**What `tag_gps.py` writes** (nothing else; the pixels are checked to be unchanged): the EXIF GPS block (latitude,
+longitude, accuracy, direction, date and time) and `ImageDescription` = one JSON string
+`{"routeId","routeVersionId","assignmentId","recordingId","recordingIndex","purpose","stepM","frame"}`. No worker or device
+information. `anonymize.py` itself still strips all metadata; tagging happens afterwards.
+
+**Face threshold.** For a single image there are no neighbouring frames to catch a missed face, so the pipeline and the
+worker use `--face-conf 0.15` (anonymize.py's own default is 0.222). Check the output before sharing: the model still
+misses small or turned-away faces.
+
 ## Worker (automatic, for the field-capture app)
 
 `worker.py` runs `anonymize.py` automatically on every recording the field-capture app has finished
@@ -89,11 +138,19 @@ storage credentials). Standard library only.
 export ANONYMIZER_TOKEN=...   # same value as ANONYMIZER_TOKEN in the app's .env (32+ characters)
 $PY worker.py --server https://your-host.your-tailnet.ts.net           # runs until stopped
 $PY worker.py --server https://... --once                              # drain the queue, then exit
-$PY worker.py --server https://... --mode gaussian --device cuda --extra "--padding 0.3"
+$PY worker.py --server https://... --mode pixelgauss --device cuda --extra "--padding 0.3"
 ```
 
-For each recording it claims a job, downloads the original, runs `anonymize.py` (default
-`--mode solid`, the irreversible one), checks the output and uploads it. A heartbeat keeps the claim
+It takes two kinds of job (`--kinds frames,video`, the default; frames first):
+
+- **frames**: downloads the video and GPS, runs `sample_frames.py`, then `anonymize.py` on those frames, then `tag_gps.py`
+  if the assignment is for inference, and uploads every image. Recordings of one assignment are done in order, so the
+  distance counter carries on (a later recording is the continuation of the earlier ones). The raw frames stay in a temporary folder here and are deleted. The step is the server's
+  `SAMPLE_STEP_M`.
+- **video**: claims a job, downloads the original, runs `anonymize.py` (default `--mode pixelgauss`; `--mode solid` is the
+  irreversible one), checks the output and uploads the whole anonymized video.
+
+For both it checks the output and uploads it. A heartbeat keeps the claim
 alive; if the worker dies the app gives the job to the next claim, and after 3 failed attempts it
 marks the recording failed for an admin to retry. `Ctrl+C` or `SIGTERM` gives the job back at once.
 Several workers can run side by side. Details, failure handling and who may download what are in the

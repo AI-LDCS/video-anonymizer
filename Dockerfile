@@ -1,4 +1,5 @@
-# The anonymizer worker: worker.py polls the field-capture app and runs anonymize.py on each recording.
+# The anonymizer worker: worker.py polls the field-capture app and, for each recording, cuts still images
+# (sample_frames.py), hides faces and plates (anonymize.py) and tags GPS (tag_gps.py); or anonymizes the whole video.
 #
 # GPU (the normal way, Linux with an NVIDIA GPU, the driver and nvidia-container-toolkit on the host):
 #   docker compose --profile gpu up -d --build
@@ -23,6 +24,6 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then echo "opencv-python==4.10.0.84" > /co
 RUN if [ -n "$TORCH_INDEX" ]; then pip install --no-cache-dir torch torchvision --index-url "$TORCH_INDEX"; \
     else pip install --no-cache-dir torch torchvision; fi \
  && pip install --no-cache-dir -c /constraints.txt -r requirements.txt
-COPY anonymize.py worker.py ./
+COPY anonymize.py worker.py sample_frames.py tag_gps.py ./
 # the model is mounted (see docker-compose.yml), not baked into the image
 CMD ["python", "worker.py"]

@@ -8,7 +8,11 @@ touches the database or object storage. Standard library only.
     export ANONYMIZER_TOKEN=...            # same value as the server's .env
     python worker.py --server https://host.tailnet.ts.net
 
-One recording at a time: claim -> download the original -> anonymize.py -> upload -> next.
+Two kinds of job (--kinds, default both):
+  frames  claim -> download the original video -> sample_frames.py (the sharpest frame every few metres)
+          -> anonymize.py on those images -> tag_gps.py (inference only) -> upload every image -> next.
+          The raw, un-anonymized frames stay in a temporary folder on this machine and are deleted.
+  video   claim -> download the original -> anonymize.py on the whole video -> upload -> next.
 The claim is a lease the worker keeps alive with a heartbeat; if this process dies, the server
 gives the recording to the next claim. Several workers can run at once.
 """
@@ -27,7 +31,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 HERE = Path(__file__).resolve().parent
 BLOCK = 1 << 20
@@ -93,20 +97,53 @@ class Api:
         finally:
             conn.close()
 
-    def claim(self):
-        return self.call("POST", "/api/anonymizer/claim", body={})
+    @staticmethod
+    def _base(kind):
+        return "/api/anonymizer/frames" if kind == "frames" else "/api/anonymizer"
 
-    def heartbeat(self, rid, lease):
-        return self.call("POST", f"/api/anonymizer/{rid}/heartbeat", lease=lease, body={})
+    def claim(self, kind="video"):
+        return self.call("POST", f"{self._base(kind)}/claim", body={})
 
-    def fail(self, rid, lease, message):
-        return self.call("POST", f"/api/anonymizer/{rid}/fail", lease=lease, body={"error": message[:500]})
+    def heartbeat(self, rid, lease, kind="video"):
+        return self.call("POST", f"{self._base(kind)}/{rid}/heartbeat", lease=lease, body={})
 
-    def download(self, rid, lease, dest: Path):
+    def fail(self, rid, lease, message, kind="video"):
+        return self.call("POST", f"{self._base(kind)}/{rid}/fail", lease=lease, body={"error": message[:500]})
+
+    def complete_frames(self, rid, lease, body):
+        return self.call("POST", f"{self._base('frames')}/{rid}/complete", lease=lease, body=body)
+
+    def upload_frame(self, rid, lease, number, src: Path, sha256, meta):
+        """One anonymized image. The frame's metadata travels in a header; the body is the file."""
+        conn = self._conn()
+        try:
+            conn.putrequest("PUT", f"{self.prefix}{self._base('frames')}/{rid}/image/{number}")
+            for k, v in self._headers(lease, {
+                "Content-Type": "image/png",
+                "Content-Length": str(src.stat().st_size),
+                "x-sha256": sha256,
+                "x-frame": quote(json.dumps(meta, separators=(",", ":"))),
+            }).items():
+                conn.putheader(k, v)
+            conn.endheaders()
+            try:
+                with open(src, "rb") as f:
+                    while block := f.read(BLOCK):
+                        conn.send(block)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the server answered early (for example a lost lease); its reply says why
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.status >= 300:
+                self._fail(resp, raw)
+        finally:
+            conn.close()
+
+    def download(self, rid, lease, dest: Path, kind="video"):
         """Streams the original into `dest`. Returns (bytes, sha256)."""
         conn = self._conn()
         try:
-            conn.request("GET", f"{self.prefix}/api/anonymizer/{rid}/source", headers=self._headers(lease))
+            conn.request("GET", f"{self.prefix}{self._base(kind)}/{rid}/source", headers=self._headers(lease))
             resp = conn.getresponse()
             if resp.status != 200:
                 self._fail(resp, resp.read())
@@ -159,15 +196,15 @@ def sha256_of(path: Path):
 class Heartbeat(threading.Thread):
     """Keeps the lease alive while anonymize.py runs. If the server says the lease is gone, stops the job."""
 
-    def __init__(self, api, rid, lease, every, on_lost):
+    def __init__(self, api, rid, lease, every, on_lost, kind="video"):
         super().__init__(daemon=True)
-        self.api, self.rid, self.lease, self.every, self.on_lost = api, rid, lease, every, on_lost
+        self.api, self.rid, self.lease, self.every, self.on_lost, self.kind = api, rid, lease, every, on_lost, kind
         self.stop_event = threading.Event()
 
     def run(self):
         while not self.stop_event.wait(self.every):
             try:
-                self.api.heartbeat(self.rid, self.lease)
+                self.api.heartbeat(self.rid, self.lease, self.kind)
             except ApiError as e:
                 if e.status in (404, 409):
                     log(f"lease lost for {self.rid}: {e}")
@@ -178,7 +215,7 @@ class Heartbeat(threading.Thread):
                 log(f"heartbeat failed (will retry): {e}")
 
 
-def build_command(args, src: Path, out_dir: Path, out_file: Path):
+def build_command(args, src: Path, out_dir: Path, out_file: Path, frames=False):
     if args.anonymize_cmd:  # a stand-in for tests: placeholders {input} {out_dir} {out_file}
         return [t.format(input=src, out_dir=out_dir, out_file=out_file) for t in shlex.split(args.anonymize_cmd)]
     extra = shlex.split(args.extra)
@@ -186,6 +223,8 @@ def build_command(args, src: Path, out_dir: Path, out_file: Path):
            "--mode", args.mode, "--device", args.device]
     if "--workers" not in extra:  # share the CPUs between the jobs running at once, unless told otherwise
         cmd += ["--workers", str(args.job_workers)]
+    if frames and "--face-conf" not in extra:  # single images have no neighbour frames, so detect a little more eagerly
+        cmd += ["--face-conf", str(args.face_conf)]
     return cmd + extra
 
 
@@ -260,12 +299,93 @@ def process(api, args, job):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def run_step(name, cmd, lost: threading.Event):
+    """One helper tool (sampling, tagging) as a subprocess; stops early if the claim is lost."""
+    code, tail = run_anonymizer([str(c) for c in cmd], lost)
+    if lost.is_set() or STOP.is_set():
+        raise RuntimeError("the claim was lost" if lost.is_set() else "the worker was stopped")
+    if code != 0:
+        raise RuntimeError(f"{name} exited with {code}: " + " / ".join(tail[-4:]))
+
+
+def process_frames(api, args, job):
+    rid, lease = job["id"], job["leaseId"]
+    log(f"claimed frames of {rid} (attempt {job['attempt']}, step {job['stepM']} m, purpose {job['purpose']})")
+    work = Path(tempfile.mkdtemp(prefix=f"frames-{rid[:8]}-", dir=args.work_dir))
+    lost = threading.Event()
+    beat = Heartbeat(api, rid, lease, max(5, job["leaseSeconds"] / 3), lost.set, "frames")
+    beat.start()
+    try:
+        video, raw, anon = work / f"video.{job['ext']}", work / "raw", work / "anon"
+        n, digest = api.download(rid, lease, video, "frames")
+        if n != job["bytes"] or digest != job["sha256"]:
+            raise RuntimeError(f"download does not match the server's checksum ({n} bytes)")
+        gps = work / "gps.json"
+        gps.write_text(json.dumps({"points": job["gps"]}))
+
+        cmd = [sys.executable, HERE / "sample_frames.py", "--video", video, "--gps", gps, "--output", raw,
+               "--step", job["stepM"], "--gap-max", job["gapMaxM"], "--prefix", rid[:8]]
+        if job.get("carry"):
+            (work / "state_in.json").write_text(json.dumps(job["carry"]))
+            cmd += ["--state-in", work / "state_in.json"]
+        if job.get("timeUncertain"):
+            cmd.append("--time-uncertain")
+        log("sampling frames")
+        run_step("sample_frames.py", cmd, lost)
+        doc = json.loads((raw / "frames.json").read_text())
+        frames, state = doc["frames"], doc["state"]
+        if not frames:
+            raise RuntimeError("sampling found no frames")
+
+        log(f"anonymizing {len(frames)} frames")
+        code, tail = run_anonymizer(build_command(args, raw, anon, anon / "unused", frames=True), lost)
+        if lost.is_set() or STOP.is_set():
+            raise RuntimeError("the claim was lost while anonymizing" if lost.is_set() else "the worker was stopped")
+        if code != 0:
+            raise RuntimeError(f"anonymizer exited with {code}: " + " / ".join(tail[-4:]))
+        missing = [f["file"] for f in frames if not (anon / f["file"]).is_file()]
+        if missing:
+            raise RuntimeError(f"anonymizer wrote no output for {len(missing)} frame(s), for example {missing[0]}")
+
+        if job["embed"]:
+            ctx = {k: job[k] for k in ("routeId", "routeVersionId", "assignmentId", "recordingId", "recordingIndex", "purpose", "stepM")}
+            (work / "context.json").write_text(json.dumps(ctx))
+            run_step("tag_gps.py", [sys.executable, HERE / "tag_gps.py", "--images", anon, "--frames", raw / "frames.json",
+                                    "--context", work / "context.json"], lost)
+
+        log(f"uploading {len(frames)} images")
+        for fr in frames:
+            if lost.is_set() or STOP.is_set():
+                raise RuntimeError("the claim was lost while uploading" if lost.is_set() else "the worker was stopped")
+            f = anon / fr["file"]
+            api.upload_frame(rid, lease, fr["frame"], f, sha256_of(f), fr)
+        api.complete_frames(rid, lease, {"count": len(frames), "stepM": job["stepM"], "mode": args.mode, "carry": state})
+        log(f"done {rid}")
+    except BaseException as e:
+        msg = f"{type(e).__name__}: {e}"
+        log(f"FAILED frames {rid}: {msg}")
+        try:
+            r = api.fail(rid, lease, msg, "frames")
+            log(f"reported to the server (will retry: {r.get('retry')})")
+        except Exception as e2:
+            log(f"could not report the failure ({e2}); the server will take the claim back when its lease runs out")
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+    finally:
+        beat.stop_event.set()
+        shutil.rmtree(work, ignore_errors=True)  # the raw, un-anonymized frames go with it
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--server", default=os.environ.get("FIELD_APP_URL"), help="app URL, e.g. https://host.tailnet.ts.net (or FIELD_APP_URL)")
-    p.add_argument("--mode", choices=["solid", "gaussian", "pixelate"], default="solid", help="how to hide detections (default solid: irreversible)")
+    p.add_argument("--mode", choices=["pixelgauss", "solid", "gaussian", "pixelate"], default="pixelgauss", help="how to hide detections (default pixelgauss: pixelate, then smooth; solid is the irreversible one)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--extra", default="", help="more options for anonymize.py, as one quoted string, e.g. '--padding 0.3'")
+    p.add_argument("--kinds", default="frames,video",
+                   help="which jobs to take: frames (sample + anonymize images), video (anonymize the whole video), or both (default frames,video)")
+    p.add_argument("--face-conf", type=float, default=0.15,
+                   help="face threshold for frames jobs; below anonymize.py's 0.222 because a single image has no neighbour frames (default 0.15)")
     p.add_argument("--poll", type=float, default=30, help="seconds to wait when nothing is queued (default 30)")
     p.add_argument("--jobs", type=int, default=1,
                    help="recordings processed at the same time (default 1). The CPUs are shared between them; "
@@ -280,6 +400,9 @@ def parse_args():
         p.error("--server (or FIELD_APP_URL) is required")
     if a.jobs < 1:
         p.error("--jobs must be at least 1")
+    a.kinds = [k.strip() for k in a.kinds.split(",") if k.strip()]
+    if not a.kinds or set(a.kinds) - {"frames", "video"}:
+        p.error("--kinds is frames, video, or frames,video")
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     a.job_workers = max(1, cpus // a.jobs)
     return a
@@ -290,7 +413,12 @@ def work_loop(api, args):
     idle = 0
     while not STOP.is_set():
         try:
-            job = api.claim()
+            kind, job = None, None
+            for k in args.kinds:  # in the order given; frames first by default, because they chain recording after recording
+                job = api.claim(k)
+                if job is not None:
+                    kind = k
+                    break
         except Exception as e:
             log(f"claim failed: {e}")
             if args.once:
@@ -306,7 +434,7 @@ def work_loop(api, args):
             STOP.wait(args.poll)
             continue
         idle = 0
-        process(api, args, job)
+        (process_frames if kind == "frames" else process)(api, args, job)
     return 0
 
 
@@ -319,7 +447,7 @@ def main():
         Path(args.work_dir).mkdir(parents=True, exist_ok=True)
     api = Api(args.server, token, args.timeout, args.allow_http)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-    log(f"worker started: server {args.server}, mode {args.mode}, {args.jobs} job(s) at a time, {args.job_workers} CPU thread(s) each")
+    log(f"worker started: server {args.server}, jobs {'+'.join(args.kinds)}, mode {args.mode}, {args.jobs} job(s) at a time, {args.job_workers} CPU thread(s) each")
     codes = []
 
     def run():
