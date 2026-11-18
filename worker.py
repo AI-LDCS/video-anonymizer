@@ -8,11 +8,12 @@ touches the database or object storage. Standard library only.
     export ANONYMIZER_TOKEN=...            # same value as the server's .env
     python worker.py --server https://host.tailnet.ts.net
 
-Two kinds of job (--kinds, default both):
+Two kinds of job (--kinds, default frames only):
   frames  claim -> download the original video -> sample_frames.py (the sharpest frame every few metres)
           -> anonymize.py on those images -> tag_gps.py (inference only) -> upload every image -> next.
           The raw, un-anonymized frames stay in a temporary folder on this machine and are deleted.
   video   claim -> download the original -> anonymize.py on the whole video -> upload -> next.
+          Optional and slow (every frame): add it with --kinds frames,video and set ANON_VIDEO_ENABLED=true on the server.
 The claim is a lease the worker keeps alive with a heartbeat; if this process dies, the server
 gives the recording to the next claim. Several workers can run at once.
 """
@@ -332,7 +333,13 @@ def process_frames(api, args, job):
             cmd.append("--time-uncertain")
         log("sampling frames")
         run_step("sample_frames.py", cmd, lost)
-        doc = json.loads((raw / "frames.json").read_text())
+        # the sampler's metadata files move out of the folder the anonymizer reads, so it sees only images
+        meta = work / "meta"
+        meta.mkdir()
+        for name in ("frames.json", "manifest.csv", "state.json"):
+            if (raw / name).exists():
+                shutil.move(str(raw / name), str(meta / name))
+        doc = json.loads((meta / "frames.json").read_text())
         frames, state = doc["frames"], doc["state"]
         if not frames:
             raise RuntimeError("sampling found no frames")
@@ -350,7 +357,7 @@ def process_frames(api, args, job):
         if job["embed"]:
             ctx = {k: job[k] for k in ("routeId", "routeVersionId", "assignmentId", "recordingId", "recordingIndex", "purpose", "stepM")}
             (work / "context.json").write_text(json.dumps(ctx))
-            run_step("tag_gps.py", [sys.executable, HERE / "tag_gps.py", "--images", anon, "--frames", raw / "frames.json",
+            run_step("tag_gps.py", [sys.executable, HERE / "tag_gps.py", "--images", anon, "--frames", meta / "frames.json",
                                     "--context", work / "context.json"], lost)
 
         log(f"uploading {len(frames)} images")
@@ -382,8 +389,9 @@ def parse_args():
     p.add_argument("--mode", choices=["pixelgauss", "solid", "gaussian", "pixelate"], default="pixelgauss", help="how to hide detections (default pixelgauss: pixelate, then smooth; solid is the irreversible one)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--extra", default="", help="more options for anonymize.py, as one quoted string, e.g. '--padding 0.3'")
-    p.add_argument("--kinds", default="frames,video",
-                   help="which jobs to take: frames (sample + anonymize images), video (anonymize the whole video), or both (default frames,video)")
+    p.add_argument("--kinds", default="frames",
+                   help="which jobs to take: frames (sample + anonymize images), video (anonymize the whole video; slow, "
+                        "and the server must have ANON_VIDEO_ENABLED=true), or frames,video (default frames)")
     p.add_argument("--face-conf", type=float, default=0.15,
                    help="face threshold for frames jobs; below anonymize.py's 0.222 because a single image has no neighbour frames (default 0.15)")
     p.add_argument("--poll", type=float, default=30, help="seconds to wait when nothing is queued (default 30)")
