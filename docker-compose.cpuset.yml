@@ -1,0 +1,14 @@
+# Optional: pin the worker to some CPUs when it runs on the SAME machine as the field-capture app, so the two
+# cannot starve each other. Use it on top of the normal file:
+#
+#   ANON_CPUSET=4-5 docker compose --env-file ../field-capture-app/.env \
+#     -f docker-compose.yml -f docker-compose.cpuset.yml --profile gpu up -d
+#
+# ANON_CPUSET is a list of CPU numbers: "4-5", "4,5" or "2-3,6". The worker sees only these CPUs and sizes its
+# threads from them by itself. Use a cpuset, not "cpus:": a quota leaves the worker believing it has every CPU.
+# The guide, with measurements, is docs/operations/cpu-affinity.md in the field-capture-app repository.
+services:
+  worker-gpu:
+    cpuset: ${ANON_CPUSET:?set ANON_CPUSET, for example 4-5}
+  worker-cpu:
+    cpuset: ${ANON_CPUSET:?set ANON_CPUSET, for example 4-5}
